@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -119,6 +120,84 @@ func TestStateRootRethVM(t *testing.T) {
 
 func TestStateRootEvm2VM(t *testing.T) {
 	testStateRootOnly(t, NewEvm2VM("", ""), "evm2")
+}
+
+func TestEvm2Output(t *testing.T) {
+	const root = "0xad1024c87b5548e77c937aa50f72b6cb620d278f4dd79bae7f78f71ff75af458"
+	const trace = `{"pc":0,"op":96,"gas":"0x100","gasCost":"0x3","stack":[],"depth":1,"returnData":"0x","refund":"0x0","memSize":0,"opName":"PUSH1"}
+{"pc":2,"op":0,"gas":"0xfd","gasCost":"0x0","stack":["0x1"],"depth":1,"returnData":"0x","refund":"0x0","memSize":0,"opName":"STOP"}
+{"stateRoot":"` + root + `","output":"0x","gasUsed":"0x3"}
+`
+	vm := NewEvm2VM("", "evm2")
+	var output bytes.Buffer
+	vm.Copy(&output, bytes.NewBufferString(trace))
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want one opcode and one state root, got %d lines: %s", len(lines), output.String())
+	}
+	if !strings.Contains(lines[0], `"opName":"PUSH1"`) {
+		t.Fatalf("unexpected canonical trace: %s", lines[0])
+	}
+	outcome := `{"stateRoot":"` + root + `","pass":false}`
+	got, err := vm.ParseStateRoot([]byte(outcome))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root {
+		t.Fatalf("have root %q, want %q", got, root)
+	}
+}
+
+func TestEvm2ExitHandling(t *testing.T) {
+	stub := filepath.Join(t.TempDir(), "evm2-stub")
+	stubSource := `#!/bin/sh
+case " $* " in
+  *" --json-output "*) ;;
+  *) exit 2 ;;
+esac
+printf '%s\n' "$EVM2_TEST_STDOUT"
+printf '%s\n' "$EVM2_TEST_STDERR" >&2
+exit 1
+`
+	if err := os.WriteFile(stub, []byte(stubSource), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	const root = "0xad1024c87b5548e77c937aa50f72b6cb620d278f4dd79bae7f78f71ff75af458"
+	tests := []struct {
+		name    string
+		outcome string
+		wantErr bool
+	}{
+		{name: "fixture mismatch", outcome: `{"stateRoot":"` + root + `","pass":false}`},
+		{name: "unexpected exception", outcome: `{"stateRoot":"` + root + `","pass":false,"errorMsg":"unexpected exception"}`},
+		{name: "missing outcome", wantErr: true},
+		{name: "trace footer only", outcome: `{"stateRoot":"` + root + `"}`, wantErr: true},
+		{name: "malformed state root", outcome: `{"stateRoot":"0x01","pass":false}`, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EVM2_TEST_STDOUT", tc.outcome)
+			t.Setenv("EVM2_TEST_STDERR", "fixture validation failed")
+			vm := NewEvm2VM(stub, "evm2")
+			var output bytes.Buffer
+			_, err := vm.RunStateTest("fixture.json", &output, false)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected incomplete outcome to preserve the process error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected complete outcome to succeed: %v", err)
+			}
+
+			gotRoot, _, rootErr := vm.GetStateRoot("fixture.json")
+			if tc.wantErr && rootErr == nil {
+				t.Fatalf("GetStateRoot accepted %s with root %q", tc.name, gotRoot)
+			}
+			if !tc.wantErr && (rootErr != nil || gotRoot != root) {
+				t.Fatalf("GetStateRoot returned root %q, error %v", gotRoot, rootErr)
+			}
+		})
+	}
 }
 
 func TestStateRootEelsVM(t *testing.T) {
