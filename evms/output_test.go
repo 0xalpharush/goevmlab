@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -116,6 +117,110 @@ func TestStateRootRethVM(t *testing.T) {
 	testStateRootOnly(t, NewRethVM("", ""), "revm")
 }
 
+func TestEvm2Output(t *testing.T) {
+	const raw = `{"pc":0,"op":96,"gas":"0x100","gasCost":"0x3","stack":[],"depth":1,"returnData":"0x","refund":"0x0","memSize":0,"opName":"PUSH1"}
+{"pc":2,"op":0,"gas":"0xfd","gasCost":"0x0","stack":["0x1"],"depth":1,"returnData":"0x","refund":"0x0","memSize":0,"opName":"STOP"}
+{"stateRoot":"0xad1024c87b5548e77c937aa50f72b6cb620d278f4dd79bae7f78f71ff75af458","output":"0x","gasUsed":"0x3","pass":true}
+ok: replayed state fixture.json: 1 executed, 0 skipped
+`
+	vm := NewEvm2VM("", "evm2")
+	var output bytes.Buffer
+	vm.Copy(&output, bytes.NewBufferString(raw))
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want one opcode and one state root, got %d lines: %s", len(lines), output.String())
+	}
+	if !strings.Contains(lines[0], `"opName":"PUSH1"`) {
+		t.Fatalf("unexpected canonical trace: %s", lines[0])
+	}
+	root, err := vm.ParseStateRoot([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "0xad1024c87b5548e77c937aa50f72b6cb620d278f4dd79bae7f78f71ff75af458"; root != want {
+		t.Fatalf("have root %q, want %q", root, want)
+	}
+}
+
+func TestEvm2ExitHandling(t *testing.T) {
+	stub := filepath.Join(t.TempDir(), "evm2-stub")
+	stubSource := `#!/bin/sh
+case " $* " in
+  *" --json-output "*) ;;
+  *) exit 2 ;;
+esac
+printf '%s\n' "$EVM2_TEST_STDOUT"
+printf '%s\n' "$EVM2_TEST_STDERR" >&2
+exit 1
+`
+	if err := os.WriteFile(stub, []byte(stubSource), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	const root = "0xad1024c87b5548e77c937aa50f72b6cb620d278f4dd79bae7f78f71ff75af458"
+	const zeroRoot = "0x0000000000000000000000000000000000000000000000000000000000000000"
+	tests := []struct {
+		name    string
+		outcome string
+		wantErr bool
+	}{
+		{
+			name:    "placeholder state root",
+			outcome: `{"stateRoot":"` + root + `","pass":false,"errorMsg":"state root mismatch: got ` + root + `, expected ` + zeroRoot + `"}`,
+		},
+		{
+			name:    "placeholder logs root",
+			outcome: `{"stateRoot":"` + root + `","pass":false,"errorMsg":"logs root mismatch: got 0x01, expected ` + zeroRoot + `"}`,
+		},
+		{
+			name:    "non-placeholder mismatch",
+			outcome: `{"stateRoot":"` + root + `","pass":false,"errorMsg":"state root mismatch: got ` + root + `, expected 0x0100000000000000000000000000000000000000000000000000000000000000"}`,
+		},
+		{
+			name:    "unexpected exception",
+			outcome: `{"stateRoot":"` + root + `","pass":false,"errorMsg":"unexpected exception: got Some(transaction validation error), expected None"}`,
+		},
+		{
+			name:    "missing machine outcome",
+			outcome: "",
+			wantErr: true,
+		},
+		{
+			name:    "malformed state root",
+			outcome: `{"stateRoot":"0x01","pass":false,"errorMsg":"fixture assertion failed"}`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EVM2_TEST_STDOUT", `{"stateRoot":"`+root+`","output":"0x","gasUsed":"0x0"}`+"\n"+tc.outcome)
+			t.Setenv("EVM2_TEST_STDERR", "fixture validation failed")
+			vm := NewEvm2VM(stub, "evm2")
+			var output bytes.Buffer
+			_, err := vm.RunStateTest("fixture.json", &output, false)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("expected complete outcome to succeed: %v", err)
+				}
+				if got := strings.TrimSpace(output.String()); got != `{"stateRoot":"`+root+`"}` {
+					t.Fatalf("unexpected canonical output %q", got)
+				}
+			} else if err == nil {
+				t.Fatal("expected incomplete outcome to preserve the process error")
+			}
+
+			gotRoot, _, rootErr := vm.GetStateRoot("fixture.json")
+			if !tc.wantErr {
+				if rootErr != nil || gotRoot != root {
+					t.Fatalf("GetStateRoot returned root %q, error %v", gotRoot, rootErr)
+				}
+			} else if rootErr == nil {
+				t.Fatalf("GetStateRoot accepted %s with root %q", tc.name, gotRoot)
+			}
+		})
+	}
+}
+
 func TestStateRootEelsVM(t *testing.T) {
 	testStateRootOnly(t, NewEelsEVM("", "eels"), "eels")
 }
@@ -184,6 +289,9 @@ func createEvmsFromEnv() []Evm {
 	}
 	if k := "RETH_BIN"; os.Getenv(k) != "" {
 		vms = append(vms, NewRethVM(os.Getenv(k), "reth"))
+	}
+	if k := "EVM2_BIN"; os.Getenv(k) != "" {
+		vms = append(vms, NewEvm2VM(os.Getenv(k), "evm2"))
 	}
 	if k := "ERIG_BIN"; os.Getenv(k) != "" {
 		vms = append(vms, NewErigonVM(os.Getenv(k), "erigon"))
